@@ -4,248 +4,418 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score
+from torch.utils.data import Dataset, DataLoader
+from torchvision import datasets, models, transforms
+import time
+import copy
 import numpy as np
-from torch.cuda.amp import GradScaler, autocast
+from PIL import Image
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import f1_score
 
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Attempt to install facenet-pytorch
+try:
+    import facenet_pytorch
+    from facenet_pytorch import InceptionResnetV1
+    FACENET_AVAILABLE = True
+    print("facenet-pytorch is available")
+except ImportError:
+    print("Installing facenet-pytorch...")
+    try:
+        os.system("pip install facenet-pytorch")
+        from facenet_pytorch import InceptionResnetV1
+        FACENET_AVAILABLE = True
+        print("facenet-pytorch installed successfully")
+    except Exception as e:
+        print(f"Failed to install facenet-pytorch: {e}")
+        print("Falling back to ResNet50")
+        FACENET_AVAILABLE = False
 
-# Define directories
-input_train_dir = '/kaggle/input/latest-dataset/Task_B/train'
-input_val_dir = '/kaggle/input/latest-dataset/Task_B/val'
-master_dir = '/kaggle/working/Task_B/master'
-new_train_dir = '/kaggle/working/Task_B/new_train'
-new_val_dir = '/kaggle/working/Task_B/new_val'
-os.makedirs(master_dir, exist_ok=True)
-os.makedirs(new_train_dir, exist_ok=True)
-os.makedirs(new_val_dir, exist_ok=True)
+# Define paths
+DATA_DIR = '/kaggle/input/latest-dataset/Task_A'
+MASTER_DIR = '/kaggle/working/Task_A/master'
+NEW_TRAIN_DIR = '/kaggle/working/Task_A/train'
+NEW_VAL_DIR = '/kaggle/working/Task_A/val'
 
-# Function to copy images to master dataset
-def copy_images_to_master(source_dir, master_dir, suffix=''):
-    for person_folder in os.listdir(source_dir):
-        source_person_path = os.path.join(source_dir, person_folder)
-        if os.path.isdir(source_person_path):
-            master_person_path = os.path.join(master_dir, person_folder)
-            os.makedirs(master_person_path, exist_ok=True)
-            
-            # Copy normal images
-            for img_name in os.listdir(source_person_path):
-                img_path = os.path.join(source_person_path, img_name)
-                if os.path.isfile(img_path) and img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+# Step 1: Combine training and validation datasets into a master dataset
+def create_master_dataset(train_dir, val_dir, master_dir):
+    os.makedirs(master_dir, exist_ok=True)
+    def copy_images(source_dir, dest_dir, suffix=''):
+        if not os.path.exists(source_dir):
+            print(f"Error: Source directory {source_dir} does not exist")
+            return False
+        for identity in os.listdir(source_dir):
+            source_identity_path = os.path.join(source_dir, identity)
+            dest_identity_path = os.path.join(dest_dir, identity)
+            if not os.path.isdir(source_identity_path):
+                continue
+            os.makedirs(dest_identity_path, exist_ok=True)
+            for img_name in os.listdir(source_identity_path):
+                if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
                     dest_img_name = img_name if not suffix else f"{os.path.splitext(img_name)[0]}{suffix}{os.path.splitext(img_name)[1]}"
-                    shutil.copy(img_path, os.path.join(master_person_path, dest_img_name))
-            
-            # Copy distorted images
-            distortion_path = os.path.join(source_person_path, 'distortion')
-            if os.path.exists(distortion_path):
-                master_distortion_path = os.path.join(master_person_path, 'distortion')
-                os.makedirs(master_distortion_path, exist_ok=True)
-                for img_name in os.listdir(distortion_path):
-                    img_path = os.path.join(distortion_path, img_name)
-                    if os.path.isfile(img_path) and img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        dest_img_name = img_name if not suffix else f"{os.path.splitext(img_name)[0]}{suffix}{os.path.splitext(img_name)[1]}"
-                        shutil.copy(img_path, os.path.join(master_distortion_path, dest_img_name))
-
-# Function to split master dataset into train and validation
-def split_master_dataset(master_dir, new_train_dir, new_val_dir, train_ratio=0.7):
-    for person_folder in os.listdir(master_dir):
-        person_path = os.path.join(master_dir, person_folder)
-        if os.path.isdir(person_path):
-            # Create person folders in new train and val directories
-            train_person_path = os.path.join(new_train_dir, person_folder)
-            val_person_path = os.path.join(new_val_dir, person_folder)
-            os.makedirs(train_person_path, exist_ok=True)
-            os.makedirs(val_person_path, exist_ok=True)
-            
-            # Get normal images
-            normal_images = [
-                f for f in os.listdir(person_path)
-                if os.path.isfile(os.path.join(person_path, f)) and f.lower().endswith(('.png', '.jpg', '.jpeg'))
-            ]
-            
-            # Get distorted images
-            distortion_path = os.path.join(person_path, 'distortion')
-            distorted_images = [
-                f for f in os.listdir(distortion_path)
-                if os.path.isfile(os.path.join(distortion_path, f)) and f.lower().endswith(('.png', '.jpg', '.jpeg'))
-            ] if os.path.exists(distortion_path) else []
-            
-            # Combine and shuffle all images
-            all_images = normal_images + [f"distortion/{f}" for f in distorted_images]
-            random.shuffle(all_images)
-            
-            # Split images
-            train_count = int(len(all_images) * train_ratio)
-            if len(all_images) == 1:  # Handle single-image cases
-                train_count = 1
-                train_images = all_images[:train_count]
-                val_images = all_images[:train_count]  # Duplicate single image
-            else:
-                train_images = all_images[:train_count]
-                val_images = all_images[train_count:]
-            
-            # Copy training images
-            train_distortion_path = os.path.join(train_person_path, 'distortion')
-            os.makedirs(train_distortion_path, exist_ok=True)
-            for img in train_images:
-                src_path = os.path.join(master_dir, person_folder, img)
-                dest_path = os.path.join(new_train_dir, person_folder, img)
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copy(src_path, dest_path)
-            
-            # Copy validation images
-            val_distortion_path = os.path.join(val_person_path, 'distortion')
-            os.makedirs(val_distortion_path, exist_ok=True)
-            for img in val_images:
-                src_path = os.path.join(master_dir, person_folder, img)
-                dest_path = os.path.join(new_val_dir, person_folder, img)
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copy(src_path, dest_path)
-
-# Function to train the model with early stopping
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=30, patience=5):
-    model.train()
-    scaler = GradScaler()
-    best_val_loss = float('inf')
-    patience_counter = 0
-    best_model_path = '/kaggle/working/best_face_recognition_model.pth'
-    
-    for epoch in range(num_epochs):
-        # Training phase
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            with autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            running_loss += loss.item()
-        epoch_loss = running_loss / len(train_loader)
-        epoch_accuracy = correct / total
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-        val_loss = val_loss / len(val_loader)
-        val_accuracy = val_correct / val_total
-        
-        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {epoch_loss:.4f}, Train Accuracy: {epoch_accuracy:.4f}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
-        
-        # Early stopping check
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  Saved best model with Val Loss: {best_val_loss:.4f}")
-        else:
-            patience_counter += 1
-            print(f"  Patience counter: {patience_counter}/{patience}")
-            if patience_counter >= patience:
-                print(f"Early stopping triggered after {epoch+1} epochs")
-                break
-
-# Function to evaluate the model
-def evaluate_model(model, val_loader):
-    model.eval()
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
-    top1_accuracy = accuracy_score(all_labels, all_preds)
-    macro_f1 = f1_score(all_labels, all_preds, average='macro')
-    
-    return top1_accuracy, macro_f1
-
-# Main execution
-if __name__ == "__main__":
-    # Step 1: Create master dataset
+                    try:
+                        shutil.copy(os.path.join(source_identity_path, img_name), os.path.join(dest_identity_path, dest_img_name))
+                    except (shutil.Error, OSError) as e:
+                        print(f"Error copying {img_name}: {e}")
+        return True
     print("Copying training images to master dataset...")
-    copy_images_to_master(input_train_dir, master_dir)
+    if not copy_images(os.path.join(train_dir, 'train'), master_dir):
+        return False
     print("Copying validation images to master dataset...")
-    copy_images_to_master(input_val_dir, master_dir, suffix='_val')
-    
-    # Verify master dataset
-    master_folders = [f for f in os.listdir(master_dir) if os.path.isdir(os.path.join(master_dir, f))]
-    print(f"Total person folders in master dataset: {len(master_folders)}")
-    print("Sample person folders:", master_folders[:5])
-    
-    # Step 2: Split master dataset
-    print("Splitting master dataset into new train and validation sets...")
-    split_master_dataset(master_dir, new_train_dir, new_val_dir)
-    
-    # Verify split
-    train_folders = [f for f in os.listdir(new_train_dir) if os.path.isdir(os.path.join(new_train_dir, f))]
-    val_folders = [f for f in os.listdir(new_val_dir) if os.path.isdir(os.path.join(new_val_dir, f))]
-    common_folders = set(train_folders).intersection(set(val_folders))
-    print(f"Training folders: {len(train_folders)}")
-    print(f"Validation folders: {len(val_folders)}")
-    print(f"Common folders: {len(common_folders)}")
-    print("Sample common folders:", sorted(list(common_folders))[:5])
-    
-    # Step 3: Define image transformations and load datasets
-    transform = transforms.Compose([
+    if not copy_images(os.path.join(train_dir, 'val'), master_dir, suffix='_val'):
+        return False
+    for identity in os.listdir(master_dir):
+        identity_path = os.path.join(master_dir, identity)
+        if os.path.isdir(identity_path):
+            image_count = len([img for img in os.listdir(identity_path) if img.lower().endswith(('.png', '.jpg', '.jpeg'))])
+            print(f"Identity {identity} images in master dataset: {image_count}")
+        else:
+            print(f"Error: {identity} folder not found in master dataset")
+            return False
+    return True
+
+# Create master dataset
+print("Creating master dataset...")
+if not create_master_dataset(DATA_DIR, DATA_DIR, MASTER_DIR):
+    print("Failed to create master dataset. Exiting.")
+    exit(1)
+
+# Step 2: Split master dataset into training (70%) and validation (30%) sets
+def split_dataset(master_dir, train_dir, val_dir, train_ratio=0.7):
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(val_dir, exist_ok=True)
+    for identity in os.listdir(master_dir):
+        master_identity_path = os.path.join(master_dir, identity)
+        train_identity_path = os.path.join(train_dir, identity)
+        val_identity_path = os.path.join(val_dir, identity)
+        os.makedirs(train_identity_path, exist_ok=True)
+        os.makedirs(val_identity_path, exist_ok=True)
+        images = [img for img in os.listdir(master_identity_path) if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        if not images:
+            print(f"Warning: No images found in {master_identity_path}")
+            continue
+        random.shuffle(images)
+        train_count = int(len(images) * train_ratio)
+        train_images = images[:train_count]
+        val_images = images[train_count:]
+        for img_name in train_images:
+            shutil.copy(os.path.join(master_identity_path, img_name), os.path.join(train_identity_path, img_name))
+        for img_name in val_images:
+            shutil.copy(os.path.join(master_identity_path, img_name), os.path.join(val_identity_path, img_name))
+        print(f"Identity: {identity}")
+        print(f"  Training images: {len(train_images)}")
+        print(f"  Validation images: {len(val_images)}")
+    return True
+
+# Set random seed for reproducibility
+random.seed(42)
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Split dataset
+print("\nSplitting master dataset into train and validation...")
+if not split_dataset(MASTER_DIR, NEW_TRAIN_DIR, NEW_VAL_DIR):
+    print("Failed to split dataset. Exiting.")
+    exit(1)
+
+# Step 3: Define data transformations
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), scale=(0.8, 1.2)),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=5)], p=0.3),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.25), ratio=(0.3, 3.3)),
+    ]),
+    'val': transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
+
+# Custom Dataset for Triplets with Hard Mining
+class TripletFaceDataset(Dataset):
+    def __init__(self, root_dir, transform=None, model=None, device='cpu'):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.model = model
+        self.device = device
+        self.identities = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+        self.image_paths = []
+        self.identity_to_images = {}
+        self.embedding_cache = None
+        for identity in self.identities:
+            identity_path = os.path.join(root_dir, identity)
+            images = [os.path.join(identity_path, img) for img in os.listdir(identity_path) if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            if len(images) >= 2:
+                self.identity_to_images[identity] = images
+                self.image_paths.extend([(img, identity) for img in images])
+        print(f"Found {len(self.identities)} identities with sufficient images")
+
+    def update_embedding_cache(self):
+        if self.model is None:
+            return
+        self.model.eval()
+        self.embedding_cache = {}
+        with torch.no_grad():
+            for img_path, identity in self.image_paths:
+                img = Image.open(img_path).convert('RGB')
+                if self.transform:
+                    img = self.transform(img).unsqueeze(0).to(self.device)
+                emb = self.model(img).cpu().numpy()
+                self.embedding_cache[img_path] = emb
+        print("Updated embedding cache for hard triplet mining")
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        anchor_path, anchor_id = self.image_paths[idx]
+        positive_path = random.choice([p for p in self.identity_to_images[anchor_id] if p != anchor_path])
+        negative_id = random.choice([i for i in self.identities if i != anchor_id])
+        
+        if self.embedding_cache and random.random() < 0.5:
+            anchor_emb = self.embedding_cache[anchor_path]
+            min_dist = float('inf')
+            hard_negative_path = None
+            for neg_id in self.identities:
+                if neg_id == anchor_id:
+                    continue
+                for neg_path in self.identity_to_images[neg_id]:
+                    neg_emb = self.embedding_cache[neg_path]
+                    dist = 1 - cosine_similarity(anchor_emb, neg_emb)[0][0]
+                    if dist < min_dist:
+                        min_dist = dist
+                        hard_negative_path = neg_path
+            negative_path = hard_negative_path if hard_negative_path else random.choice(self.identity_to_images[negative_id])
+        else:
+            negative_path = random.choice(self.identity_to_images[negative_id])
+        
+        anchor_img = Image.open(anchor_path).convert('RGB')
+        positive_img = Image.open(positive_path).convert('RGB')
+        negative_img = Image.open(negative_path).convert('RGB')
+        
+        if self.transform:
+            anchor_img = self.transform(anchor_img)
+            positive_img = self.transform(positive_img)
+            negative_img = self.transform(negative_img)
+        
+        return anchor_img, positive_img, negative_img
+
+# Load datasets
+try:
+    image_datasets = {
+        'train': TripletFaceDataset(NEW_TRAIN_DIR, data_transforms['train']),
+        'val': TripletFaceDataset(NEW_VAL_DIR, data_transforms['val']),
+    }
+except Exception as e:
+    print(f"Error loading datasets: {e}")
+    exit(1)
+
+# Create data loaders
+dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
+dataloaders = {
+    'train': DataLoader(image_datasets['train'], batch_size=32, shuffle=True, num_workers=2 if torch.cuda.is_available() else 0),
+    'val': DataLoader(image_datasets['val'], batch_size=32, shuffle=False, num_workers=2 if torch.cuda.is_available() else 0),
+}
+
+print(f"Training samples: {dataset_sizes['train']}")
+print(f"Validation samples: {dataset_sizes['val']}")
+
+# Set device
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Define the Embedding Model
+class EmbeddingNet(nn.Module):
+    def __init__(self):
+        super(EmbeddingNet, self).__init__()
+        if FACENET_AVAILABLE:
+            self.backbone = InceptionResnetV1(pretrained='vggface2')
+            self.input_dim = 512
+        else:
+            self.backbone = models.resnet50(weights='DEFAULT')
+            self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
+            self.input_dim = 2048
+        self.bn = nn.BatchNorm1d(self.input_dim)
+        self.fc = nn.Linear(self.input_dim, 256)
+        self.normalize = lambda x: x / torch.norm(x, dim=1, keepdim=True)
+
+    def forward(self, x):
+        x = self.backbone(x)
+        if not FACENET_AVAILABLE:
+            x = x.view(x.size(0), -1)
+        x = self.bn(x)
+        x = self.fc(x)
+        x = self.normalize(x)
+        return x
+
+# Triplet Loss
+class TripletLoss(nn.Module):
+    def __init__(self, margin=1.2):
+        super(TripletLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, anchor, positive, negative):
+        distance_positive = (anchor - positive).pow(2).sum(1)
+        distance_negative = (anchor - negative).pow(2).sum(1)
+        losses = torch.relu(distance_positive - distance_negative + self.margin)
+        return losses.mean()
+
+# Training function
+def train_model(model, criterion, optimizer, scheduler, dataloaders, dataset_sizes, image_datasets, num_epochs=50):
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+    patience = 10
+    epochs_no_improve = 0
+    start_time = time.time()
+
+    # Initialize dataset with model for hard triplet mining
+    image_datasets['train'].model = model
+    image_datasets['train'].device = device
+
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        if epoch % 5 == 0 and epoch > 0:
+            image_datasets['train'].update_embedding_cache()
+        
+        for phase in ['train', 'val']:
+            model.train() if phase == 'train' else model.eval()
+            running_loss = 0.0
+            num_triplets = 0
+            all_preds = []
+            all_labels = []
+
+            for anchors, positives, negatives in dataloaders[phase]:
+                anchors, positives, negatives = anchors.to(device), positives.to(device), negatives.to(device)
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    anchor_emb = model(anchors)
+                    positive_emb = model(positives)
+                    negative_emb = model(negatives)
+                    loss = criterion(anchor_emb, positive_emb, negative_emb)
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                if phase == 'val':
+                    pos_sim = torch.cosine_similarity(anchor_emb, positive_emb)
+                    neg_sim = torch.cosine_similarity(anchor_emb, negative_emb)
+                    preds_tensor = (pos_sim > neg_sim).long()
+                    labels_tensor = torch.ones_like(preds_tensor)
+                    preds = preds_tensor.cpu().numpy()
+                    labels = labels_tensor.cpu().numpy()
+                    all_preds.extend(preds)
+                    all_labels.extend(labels)
+
+                running_loss += loss.item() * anchors.size(0)
+                num_triplets += anchors.size(0)
+
+            epoch_loss = running_loss / num_triplets
+            if phase == 'val':
+                epoch_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+                epoch_f1 = f1_score(all_labels, all_preds, average='macro')
+                print(f'{phase.capitalize()} Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}, F1-Score: {epoch_f1:.4f}')
+                scheduler.step(epoch_loss)
+                if epoch_acc > best_acc:
+                    best_acc = epoch_acc
+                    best_model_wts = copy.deepcopy(model.state_dict())
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f'Early stopping after {epoch + 1} epochs')
+                    model.load_state_dict(best_model_wts)
+                    print(f'Training completed in {time.time() - start_time:.0f}s')
+                    print(f'Best validation Accuracy: {best_acc:.4f}')
+                    return model
+            else:
+                print(f'{phase.capitalize()} Loss: {epoch_loss:.4f}')
+        print('-' * 10)
+
+    print(f'Training completed in {time.time() - start_time:.0f}s')
+    print(f'Best validation Accuracy: {best_acc:.4f}')
+    model.load_state_dict(best_model_wts)
+    return model
+
+# Inference function
+def evaluate_model(model, val_dir):
+    model.eval()
+    reference_embeddings = {}
+    for identity in os.listdir(val_dir):
+        identity_path = os.path.join(val_dir, identity)
+        if not os.path.isdir(identity_path):
+            continue
+        embeddings = []
+        for img_name in os.listdir(identity_path):
+            if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                img_path = os.path.join(identity_path, img_name)
+                img = Image.open(img_path).convert('RGB')
+                img = data_transforms['val'](img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    emb = model(img).cpu().numpy()
+                embeddings.append(emb)
+        reference_embeddings[identity] = np.mean(embeddings, axis=0)
     
-    train_dataset = datasets.ImageFolder(new_train_dir, transform=transform)
-    val_dataset = datasets.ImageFolder(new_val_dir, transform=transform)
+    correct = 0
+    total = 0
+    true_labels = []
+    pred_labels = []
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    for identity in os.listdir(val_dir):
+        identity_path = os.path.join(val_dir, identity)
+        if not os.path.isdir(identity_path):
+            continue
+        for img_name in os.listdir(identity_path):
+            if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                img_path = os.path.join(identity_path, img_name)
+                img = Image.open(img_path).convert('RGB')
+                img = data_transforms['val'](img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    test_emb = model(img).cpu().numpy()
+                min_dist = float('inf')
+                predicted_identity = None
+                for ref_id, ref_emb in reference_embeddings.items():
+                    dist = 1 - cosine_similarity(test_emb, ref_emb)[0][0]
+                    if dist < min_dist:
+                        min_dist = dist
+                        predicted_identity = ref_id
+                true_labels.append(identity)
+                pred_labels.append(predicted_identity)
+                if predicted_identity == identity:
+                    correct += 1
+                total += 1
     
-    # Step 4: Initialize and train ResNet-50 model
-    class_names = train_dataset.classes
-    num_classes = len(class_names)
+    top1_accuracy = correct / total if total > 0 else 0
+    macro_f1 = f1_score(true_labels, pred_labels, average='macro') if total > 0 else 0
     
-    model = models.resnet50(pretrained=True)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    model = model.to(device)
-    
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
-    print("Training model...")
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=30, patience=5)
-    
-    # Step 5: Load best model and evaluate
-    print("Loading best model for evaluation...")
-    model.load_state_dict(torch.load('/kaggle/working/best_face_recognition_model.pth'))
-    print("Evaluating model...")
-    top1_accuracy, macro_f1 = evaluate_model(model, val_loader)
-    print(f"Top-1 Accuracy: {top1_accuracy:.4f}")
-    print(f"Macro-averaged F1-Score: {macro_f1:.4f}")
-    
-    # Save the final model
-    torch.save(model.state_dict(), '/kaggle/working/face_recognition_model.pth')
+    print(f'Top-1 Validation Accuracy: {top1_accuracy:.4f}')
+    print(f'Macro-averaged F1-Score: {macro_f1:.4f}')
+
+# Initialize model, criterion, optimizer, scheduler
+model = EmbeddingNet().to(device)
+criterion = TripletLoss(margin=1.2)
+optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+# Train model
+print("\nStarting training with Triplet Network...")
+model = train_model(model, criterion, optimizer, scheduler, dataloaders, dataset_sizes, image_datasets)
+
+# Save model
+try:
+    model_save_path = '/kaggle/working/triplet_inceptionresnet.pth' if FACENET_AVAILABLE else '/kaggle/working/triplet_resnet50.pth'
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+except Exception as e:
+    print(f"Error saving model: {e}")
+
+# Evaluate model
+print("\nEvaluating model...")
+evaluate_model(model, NEW_VAL_DIR)
