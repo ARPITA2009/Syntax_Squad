@@ -11,7 +11,7 @@ import copy
 import numpy as np
 from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 # Attempt to install facenet-pytorch
 try:
@@ -267,7 +267,7 @@ class TripletLoss(nn.Module):
         losses = torch.relu(distance_positive - distance_negative + self.margin)
         return losses.mean()
 
-# Training function
+# Training function with additional metrics
 def train_model(model, criterion, optimizer, scheduler, dataloaders, dataset_sizes, image_datasets, num_epochs=50):
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
@@ -304,25 +304,30 @@ def train_model(model, criterion, optimizer, scheduler, dataloaders, dataset_siz
                         loss.backward()
                         optimizer.step()
 
-                if phase == 'val':
-                    pos_sim = torch.cosine_similarity(anchor_emb, positive_emb)
-                    neg_sim = torch.cosine_similarity(anchor_emb, negative_emb)
-                    preds_tensor = (pos_sim > neg_sim).long()
-                    labels_tensor = torch.ones_like(preds_tensor)
-                    preds = preds_tensor.cpu().numpy()
-                    labels = labels_tensor.cpu().numpy()
-                    all_preds.extend(preds)
-                    all_labels.extend(labels)
+                # Compute metrics
+                pos_sim = torch.cosine_similarity(anchor_emb, positive_emb)
+                neg_sim = torch.cosine_similarity(anchor_emb, negative_emb)
+                preds_tensor = (pos_sim > neg_sim).long()
+                labels_tensor = torch.ones_like(preds_tensor)
+                preds = preds_tensor.cpu().numpy()
+                labels = labels_tensor.cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels)
 
                 running_loss += loss.item() * anchors.size(0)
                 num_triplets += anchors.size(0)
 
             epoch_loss = running_loss / num_triplets
+            epoch_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+            # Use zero_division=0 to handle undefined metrics
+            epoch_f1 = f1_score(all_labels, all_preds, average='macro', pos_label=1, zero_division=0)
+            epoch_precision = precision_score(all_labels, all_preds, average='macro', pos_label=1, zero_division=0)
+            epoch_recall = recall_score(all_labels, all_preds, average='macro', pos_label=1, zero_division=0)
+            print(f'{phase.capitalize()} Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}, '
+                  f'F1-Score: {epoch_f1:.4f}, Precision: {epoch_precision:.4f}, Recall: {epoch_recall:.4f}')
+
             if phase == 'val':
-                epoch_acc = np.mean(np.array(all_preds) == np.array(all_labels))
-                epoch_f1 = f1_score(all_labels, all_preds, average='macro')
-                print(f'{phase.capitalize()} Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}, F1-Score: {epoch_f1:.4f}')
-                scheduler.step(epoch_loss)
+                scheduler.step()  # Updated scheduler call
                 if epoch_acc > best_acc:
                     best_acc = epoch_acc
                     best_model_wts = copy.deepcopy(model.state_dict())
@@ -335,8 +340,6 @@ def train_model(model, criterion, optimizer, scheduler, dataloaders, dataset_siz
                     print(f'Training completed in {time.time() - start_time:.0f}s')
                     print(f'Best validation Accuracy: {best_acc:.4f}')
                     return model
-            else:
-                print(f'{phase.capitalize()} Loss: {epoch_loss:.4f}')
         print('-' * 10)
 
     print(f'Training completed in {time.time() - start_time:.0f}s')
@@ -394,9 +397,13 @@ def evaluate_model(model, val_dir):
     
     top1_accuracy = correct / total if total > 0 else 0
     macro_f1 = f1_score(true_labels, pred_labels, average='macro') if total > 0 else 0
+    macro_precision = precision_score(true_labels, pred_labels, average='macro') if total > 0 else 0
+    macro_recall = recall_score(true_labels, pred_labels, average='macro') if total > 0 else 0
     
     print(f'Top-1 Validation Accuracy: {top1_accuracy:.4f}')
     print(f'Macro-averaged F1-Score: {macro_f1:.4f}')
+    print(f'Macro-averaged Precision: {macro_precision:.4f}')
+    print(f'Macro-averaged Recall: {macro_recall:.4f}')
 
 # Initialize model, criterion, optimizer, scheduler
 model = EmbeddingNet().to(device)
