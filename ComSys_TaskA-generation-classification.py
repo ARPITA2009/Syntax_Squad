@@ -199,16 +199,22 @@ optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
 
 # Training function with per-class metrics
-def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
+def train_model(model, criterion, optimizer, scheduler, num_epochs=50):
     """
     Trains the model with early stopping based on validation performance.
-    Computes Accuracy, Precision, Recall, and F1-Score (per-class and weighted) for validation phase.
-    Returns the model with the best validation accuracy.
+    Computes and tracks Accuracy, Precision, Recall, and F1-Score (per-class and weighted) for validation phase.
+    Returns the model with the best validation accuracy and prints all best validation metrics.
     """
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
     best_loss = float('inf')
-    patience = 7  # Increased patience for early stopping
+    best_precision = [0.0, 0.0]  # For female and male
+    best_recall = [0.0, 0.0]
+    best_f1 = [0.0, 0.0]
+    best_weighted_precision = 0.0
+    best_weighted_recall = 0.0
+    best_weighted_f1 = 0.0
+    patience = 7
     epochs_no_improve = 0
     start_time = time.time()
 
@@ -246,35 +252,61 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
                 epoch_precision = precision_score(all_labels, all_preds, average=None, zero_division=0)
                 epoch_recall = recall_score(all_labels, all_preds, average=None, zero_division=0)
                 epoch_f1 = f1_score(all_labels, all_preds, average=None, zero_division=0)
+                weighted_precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+                weighted_recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+                weighted_f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
+
                 print(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
                 print(f'  Precision (Female, Male): {epoch_precision[0]:.4f}, {epoch_precision[1]:.4f}')
                 print(f'  Recall (Female, Male): {epoch_recall[0]:.4f}, {epoch_recall[1]:.4f}')
                 print(f'  F1-Score (Female, Male): {epoch_f1[0]:.4f}, {epoch_f1[1]:.4f}')
-                print(f'  Weighted Avg - Precision: {precision_score(all_labels, all_preds, average="weighted", zero_division=0):.4f}, '
-                      f'Recall: {recall_score(all_labels, all_preds, average="weighted", zero_division=0):.4f}, '
-                      f'F1: {f1_score(all_labels, all_preds, average="weighted", zero_division=0):.4f}')
-                
+                print(f'  Weighted Avg - Precision: {weighted_precision:.4f}, '
+                      f'Recall: {weighted_recall:.4f}, F1: {weighted_f1:.4f}')
+
+                # Update best metrics if accuracy improves or if accuracy is equal but loss is lower
                 if epoch_acc > best_acc or (epoch_acc == best_acc and epoch_loss < best_loss):
                     best_acc = epoch_acc
                     best_loss = epoch_loss
+                    best_precision = epoch_precision
+                    best_recall = epoch_recall
+                    best_f1 = epoch_f1
+                    best_weighted_precision = weighted_precision
+                    best_weighted_recall = weighted_recall
+                    best_weighted_f1 = weighted_f1
                     best_model_wts = copy.deepcopy(model.state_dict())
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
+
                 if epochs_no_improve >= patience:
                     print(f'Early stopping after {epoch + 1} epochs')
                     model.load_state_dict(best_model_wts)
                     print(f'Training completed in {time.time() - start_time:.0f}s')
-                    print(f'Best validation Acc: {best_acc:.4f}, Best validation Loss: {best_loss:.4f}')
+                    print(f'\nBest Validation Metrics:')
+                    print(f'  Accuracy: {best_acc:.4f}')
+                    print(f'  Loss: {best_loss:.4f}')
+                    print(f'  Precision (Female, Male): {best_precision[0]:.4f}, {best_precision[1]:.4f}')
+                    print(f'  Recall (Female, Male): {best_recall[0]:.4f}, {best_recall[1]:.4f}')
+                    print(f'  F1-Score (Female, Male): {best_f1[0]:.4f}, {best_f1[1]:.4f}')
+                    print(f'  Weighted Avg - Precision: {best_weighted_precision:.4f}, '
+                          f'Recall: {best_weighted_recall:.4f}, F1: {best_weighted_f1:.4f}')
                     return model
                 scheduler.step(epoch_loss)
             else:
                 print(f'{phase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
     print(f'Training completed in {time.time() - start_time:.0f}s')
-    print(f'Best validation Acc: {best_acc:.4f}, Best validation Loss: {best_loss:.4f}')
+    print(f'\nBest Validation Metrics:')
+    print(f'  Accuracy: {best_acc:.4f}')
+    print(f'  Loss: {best_loss:.4f}')
+    print(f'  Precision (Female, Male): {best_precision[0]:.4f}, {best_precision[1]:.4f}')
+    print(f'  Recall (Female, Male): {best_recall[0]:.4f}, {best_recall[1]:.4f}')
+    print(f'  F1-Score (Female, Male): {best_f1[0]:.4f}, {best_f1[1]:.4f}')
+    print(f'  Weighted Avg - Precision: {best_weighted_precision:.4f}, '
+          f'Recall: {best_weighted_recall:.4f}, F1: {best_weighted_f1:.4f}')
     model.load_state_dict(best_model_wts)
     return model
+
 
 # Train model
 print("\nStarting training with ResNet50...")
